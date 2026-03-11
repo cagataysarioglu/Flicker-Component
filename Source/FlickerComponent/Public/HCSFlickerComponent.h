@@ -1,16 +1,20 @@
-// =====================================================================
+// HCS FLICKER COMPONENT
+// =========================================================================
 // Bu bileşen, ışık kaynaklarına titreme efekti ekler.
 // Çok oyunculu oyunlar için tam destek, KYM renk değişimi, özel sekanslar ve ses sistemi içerir.
-// =====================================================================
 
 #pragma once
 
 #include "Components/LightComponent.h"
+#include "Data/Enum/EFlickerMode.h"
+#include "Data/Struct/FFlickerPredictionState.h"
+#include "Data/Struct/FFlickerSequence.h"
+#include "Data/Struct/FFlickerSettings.h"
 #include "HCSFlickerComponent.generated.h"
 
-// =====================================================================
-// DELEGELER (OLAYLAR)
-// =====================================================================
+struct FFlickerLightSettings;
+struct FFlickerTimelineAsset;
+struct FFlickerTimelineKey;
 
 /**
  * Basit olay - parametre yok
@@ -31,233 +35,19 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FFlickerSoundEvent, USoundBase*, Sou
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FFlickerColorEvent, const FLinearColor&, Color);
 
 /**
+ * Zaman çizelgesi anahtar olayı - güncel anahtar indeksini bildirir
+ * @param KeyIndex - Anahtar sırası
+ */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FFlickerTimelineKeyEvent, int32, KeyIndex);
+
+/**
  * Yoğunluk olayı - ışık şiddetini bildirir
  * @param Intensity - Güncel şiddet (0-1 arası)
  * @param Alpha - Ara değer
  */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFlickerIntensityEvent, float, Intensity, float, Alpha);
 
-// =====================================================================
-// TEMEL AYARLAR YAPISI
-// =====================================================================
-
-/**
- * Titreme efekti için temel ayarlar
- * Bu yapıyla tüm titreme parametrelerini kontrol edebilirsiniz
- */
-USTRUCT(BlueprintType)
-struct FFlickerSettings
-{
-    GENERATED_BODY()
-    
-    /** Mikro titreme şiddeti (0-2 arası)
-     * 0: Titreme yok
-     * 1: Normal titreme
-     * 2: Çok şiddetli titreme
-     */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Flicker", meta=(ClampMin="0.0", ClampMax="2.0"))
-    float MicroJitterStrength = 1.0f;
-    
-    /** Ani düşüş (dip) şansı çarpanı (0-5 arası)
-     * 0: Ani düşüş olmaz
-     * 1: Normal ani düşüş sıklığı
-     * 5: Çok sık ani düşüş
-     */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Flicker", meta=(ClampMin="0.0", ClampMax="5.0"))
-    float DipChanceMultiplier = 1.0f;
-    
-    /** Ani düşüş (dip) şiddeti (0.1-5 arası)
-     * Düşük değer = daha karanlık ani düşüş
-     * Yüksek değer = daha az karanlık
-     */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Flicker", meta=(ClampMin="0.1", ClampMax="5.0"))
-    float DipStrength = 1.0f;
-    
-    /** Karartma şansı çarpanı (0-5 arası)
-     * 0: Karartma olmaz
-     * 1: Normal karartma sıklığı
-     * 5: Çok sık karartma
-     */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Flicker", meta=(ClampMin="0.0", ClampMax="5.0"))
-    float BlackoutChanceMultiplier = 1.0f;
-    
-    /** Renk değişim hızı (0-5 arası)
-     * 0: Renk değişmez
-     * 1: Normal hız
-     * 5: Çok hızlı renk değişimi
-     */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Flicker|Color", meta=(ClampMin="0.0", ClampMax="5.0"))
-    float ColorChangeSpeed = 1.0f;
-    
-    /** Renk değişim şiddeti (0-1 arası)
-     * 0: Temel renkten sapma yok
-     * 1: Temel renkten çok sapma
-     */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Flicker|Color", meta=(ClampMin="0.0", ClampMax="1.0"))
-    float ColorVariationStrength = 0.2f;
-
-    FFlickerSettings() {}
-    
-    bool operator==(const FFlickerSettings& Other) const
-    {
-        return MicroJitterStrength == Other.MicroJitterStrength && 
-               DipChanceMultiplier == Other.DipChanceMultiplier &&
-               DipStrength == Other.DipStrength && 
-               BlackoutChanceMultiplier == Other.BlackoutChanceMultiplier &&
-               ColorChangeSpeed == Other.ColorChangeSpeed &&
-               ColorVariationStrength == Other.ColorVariationStrength;
-    }
-    
-    bool operator!=(const FFlickerSettings& Other) const
-    {
-        return !(*this == Other);
-    }
-};
-
-// =====================================================================
-// IŞIK AYARLARI YAPISI
-// =====================================================================
-
-/**
- * Her bir ışık için özel ayarlar
- * Aynı aktördeki farklı ışıkları farklı şekilde titretebilirsiniz
- */
-USTRUCT(BlueprintType)
-struct FFlickerLightSettings
-{
-    GENERATED_BODY()
-    
-    /** Bu ayarların uygulanacağı ışığın etiketi
-     * Işık bileşeninin etiketine ekleyerek hangi ışığın
-     * bu ayarları kullanacağını belirleyin
-     */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Light")
-    FName LightTag = NAME_None;
-    
-    /** Temel ayarları kullan (true) veya özel ayar kullan (false) */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Light")
-    bool bUseMasterSettings = true;
-    
-    /** Özel mikro titreme şiddeti (bUseMasterSettings=false ise) */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Light", meta=(EditCondition="!bUseMasterSettings", ClampMin="0.0", ClampMax="2.0"))
-    float MicroJitterStrength = 1.0f;
-    
-    /** Özel dip şansı (bUseMasterSettings=false ise) */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Light", meta=(EditCondition="!bUseMasterSettings", ClampMin="0.0", ClampMax="5.0"))
-    float DipChanceMultiplier = 1.0f;
-    
-    /** Özel renk kullan (true) veya temel rengi kullan (false) */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Light", meta=(EditCondition="!bUseMasterSettings"))
-    bool bOverrideColor = false;
-    
-    /** Özel renk (bOverrideColor=true ise) */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Light", meta=(EditCondition="bOverrideColor"))
-    FLinearColor CustomColor = FLinearColor::White;
-};
-
-// =====================================================================
-// SEKANS ADIMI YAPISI
-// =====================================================================
-
-/**
- * Sekansın bir adımı
- * Her adımda kaç titreme yapılacağı ve ne kadar süreceği belirtilir
- */
-USTRUCT(BlueprintType)
-struct FFlickerSequenceStep
-{
-    GENERATED_BODY()
-    
-    /** Bu adımda kaç titreme yapılacak (1-100) */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Sequence", meta=(ClampMin="1", ClampMax="100"))
-    int32 FlickerCount = 1;
-    
-    /** Her titremenin süresi (saniye) */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Sequence", meta=(ClampMin="0.01", ClampMax="2.0"))
-    float FlickerDuration = 0.1f;
-    
-    /** Titremeler arası bekleme süresi (saniye) */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Sequence", meta=(ClampMin="0.0", ClampMax="1.0"))
-    float PauseBetweenFlickers = 0.05f;
-    
-    /** Bu adımda hedef ışık şiddeti (0-1)
-     * 0: Tam sönük
-     * 1: Tam parlak
-     */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Sequence", meta=(ClampMin="0.0", ClampMax="1.0"))
-    float TargetIntensity = 0.0f;
-    
-    /** Bu adımda hedef renk */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Sequence")
-    FLinearColor TargetColor = FLinearColor::Black;
-};
-
-// =====================================================================
-// SEKANS YAPISI
-// =====================================================================
-
-/**
- * Birden çok adımdan oluşan titreme sekansı
- * Önceden tanımlayıp istediğiniz zaman oynatabilirsiniz
- */
-USTRUCT(BlueprintType)
-struct FFlickerSequence
-{
-    GENERATED_BODY()
-    
-    /** Sekans adı (PlayNamedSequence() ile çağırmak için) */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Sequence")
-    FName SequenceName = NAME_None;
-    
-    /** Sekans adımları */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Sequence")
-    TArray<FFlickerSequenceStep> Steps;
-    
-    /** Sekans sonunda başa dön (sonsuz döngü) */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Sequence")
-    bool bLoop = false;
-    
-    /** Sekans bitince önceki duruma dön (yoğunluk, renk, normal titreme) */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Sequence")
-    bool bRestorePreviousState = true;
-
-    /** Her titremede ani düşüş sesi çal (normal titremedeki gibi) */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Sequence")
-    bool bPlaySoundOnEachFlicker = true; 
-};
-
-// =====================================================================
-// ÇALIŞMA MODLARI
-// =====================================================================
-
-/** Bileşenin şu an hangi modda çalıştığını belirtir */
-UENUM(BlueprintType)
-enum class EFlickerMode : uint8
-{
-    Inactive UMETA(DisplayName="Inactive"), // Hiçbir şey çalışmıyor
-    NormalFlicker UMETA(DisplayName="Normal Flicker"), // Normal titreme çalışıyor
-    Sequence UMETA(DisplayName="Sequence") // Sekans çalışıyor
-};
-
-// =====================================================================
-// ÇOĞALTMA DURUMU (İÇSEL)
-// =====================================================================
-
-/** İstemci tarafı tahmini için içsel yapı */
-USTRUCT()
-struct FFlickerPredictionState
-{
-    GENERATED_BODY()
-    
-    UPROPERTY() bool bPredictedBlackout = false;
-    UPROPERTY() float PredictedBlackoutTimeRemaining = 0.0f;
-    UPROPERTY() float PredictedIntensity = 1.0f;
-    UPROPERTY() FLinearColor PredictedColor = FLinearColor::White;
-};
-
-// =====================================================================
 // ANA BİLEŞEN SINIFI
-// =====================================================================
 
 /**
  * KULLANIM:
@@ -278,9 +68,7 @@ class FLICKERCOMPONENT_API UHCSFlickerComponent : public UActorComponent
 public:
     UHCSFlickerComponent();
 
-    // =================================================================
     // TEMEL İŞLEVLER
-    // =================================================================
     
     /** Normal titreme efektini başlatır */
     UFUNCTION(BlueprintCallable, Category="HCS Flicker")
@@ -294,9 +82,7 @@ public:
     UFUNCTION(BlueprintPure, Category="HCS Flicker")
     bool IsFlickerActive() const { return bNormalFlickerActive; }
     
-    // =================================================================
     // SEKANS İŞLEVLERİ
-    // =================================================================
     
     /**
      * Dinamik sekans oluşturup oynatır
@@ -325,10 +111,38 @@ public:
     /** Şu anki çalışma modunu döndürür */
     UFUNCTION(BlueprintPure, Category="HCS Flicker")
     EFlickerMode GetCurrentMode() const;
+
+	// ZAMAN ÇİZELGESİ İŞLEVLERİ
     
-    // =================================================================
+	/** Önceden tanımlanmış zaman çizelgesini oynat */
+	UFUNCTION(BlueprintCallable, Category="HCS Flicker|Timeline")
+	void PlayTimeline(FName TimelineName);
+    
+	/** Dinamik zaman çizelgesi oynat (anahtar karelerle) */
+	UFUNCTION(BlueprintCallable, Category="HCS Flicker|Timeline")
+	void PlayCustomTimeline(const TArray<FFlickerTimelineKey>& Keys, bool bLoop = false, bool bRestore = true);
+    
+	/** Zaman çizelgesini durdur */
+	UFUNCTION(BlueprintCallable, Category="HCS Flicker|Timeline")
+	void StopTimeline();
+    
+	/** Zaman çizelgesi oynuyor mu? */
+	UFUNCTION(BlueprintPure, Category="HCS Flicker|Timeline")
+	bool IsTimelinePlaying() const { return bTimelineActive; }
+    
+	/** Zaman çizelgesini duraklat/sürdür */
+	UFUNCTION(BlueprintCallable, Category="HCS Flicker|Timeline")
+	void SetTimelinePaused(bool bPaused);
+    
+	/** Zaman çizelgesinin geçerli zamanını ayarla (sarma) */
+	UFUNCTION(BlueprintCallable, Category="HCS Flicker|Timeline")
+	void SetTimelineTime(float NewTime);
+    
+	/** Zaman çizelgesinin toplam süresini döndür */
+	UFUNCTION(BlueprintPure, Category="HCS Flicker|Timeline")
+	float GetTimelineDuration() const;
+    
     // IŞIK İŞLEVLERİ
-    // =================================================================
     
     /** Temel ışık şiddetini ayarlar (lümen) */
     UFUNCTION(BlueprintCallable, Category="HCS Flicker|Lights")
@@ -370,9 +184,7 @@ public:
     UFUNCTION(BlueprintCallable, Category="HCS Flicker|Lights")
     void SetLightEnabled(FName LightTag, bool bEnabled);
     
-    // =================================================================
     // AYAR İŞLEVLERİ
-    // =================================================================
     
     /** Titreme ayarlarını değiştirir */
     UFUNCTION(BlueprintCallable, Category="HCS Flicker")
@@ -386,9 +198,7 @@ public:
     UFUNCTION(BlueprintPure, Category="HCS Flicker")
     FFlickerSettings GetSettings() const { return CurrentSettings; }
     
-    // =================================================================
     // DURUM SORGULAMA
-    // =================================================================
     
     /** Karartma etkin mi? */
     UFUNCTION(BlueprintPure, Category="HCS Flicker")
@@ -398,9 +208,7 @@ public:
     UFUNCTION(BlueprintPure, Category="HCS Flicker|Prediction")
     bool IsBlackoutActivePredicted() const { return bBlackoutActive || PredictionState.bPredictedBlackout; }
 
-    // =================================================================
     // GÜNCELLEME İŞLEVLERİ (Blueprint'ten çağrılabilir)
-    // =================================================================
     
     /** Her frame çağrılır - güncel yoğunluk değerini döndürür */
     UFUNCTION(BlueprintCallable, Category="HCS Flicker")
@@ -410,9 +218,7 @@ public:
     UFUNCTION(BlueprintCallable, Category="HCS Flicker|Color")
     FLinearColor UpdateFlickerColor() const;
 
-    // =================================================================
     // OLAYLAR (Blueprint'te bağlanabilir)
-    // =================================================================
     
     /** Normal titreme başladığında tetiklenir */
     UPROPERTY(BlueprintAssignable, Category="HCS Flicker|Events")
@@ -462,9 +268,19 @@ public:
     UPROPERTY(BlueprintAssignable, Category="HCS Flicker|Events|Sequence")
     FFlickerSimpleDelegate OnSequenceStepChanged;
 
-    // =================================================================
+	/** Zaman çizelgesi başladığında tetiklenir */
+	UPROPERTY(BlueprintAssignable, Category="HCS Flicker|Events|Timeline")
+	FFlickerSimpleDelegate OnTimelineStarted;
+    
+	/** Zaman çizelgesi bittiğinde tetiklenir */
+	UPROPERTY(BlueprintAssignable, Category="HCS Flicker|Events|Timeline")
+	FFlickerSimpleDelegate OnTimelineFinished;
+    
+	/** Zaman çizelgesi anahtarı değiştiğinde tetiklenir */
+	UPROPERTY(BlueprintAssignable, Category="HCS Flicker|Events|Timeline")
+	FFlickerTimelineKeyEvent OnTimelineKeyChanged;
+
     // SES AYARLARI
-    // =================================================================
     
     /** Yerleşik ses sistemini kullan (isteğe bağlı) */
     UPROPERTY(EditDefaultsOnly, Category="HCS Flicker|Audio")
@@ -478,7 +294,7 @@ public:
     UPROPERTY(EditDefaultsOnly, Category="HCS Flicker|Audio", meta=(EditCondition="bUseDistanceBasedAudio", ClampMin="100.0", ClampMax="5000.0"))
     float AudioDistanceRadius = 2000.0f;
     
-    /** Dip (ani düşüş) sesi */
+    /** Ani düşüş (dip) sesi */
     UPROPERTY(EditDefaultsOnly, Category="HCS Flicker|Audio", meta=(EditCondition="bEnableBuiltInAudio"))
     TSoftObjectPtr<USoundBase> FlickerDipSound;
     
@@ -502,9 +318,7 @@ public:
     UPROPERTY(EditDefaultsOnly, Category="HCS Flicker|Audio", meta=(EditCondition="bEnableBuiltInAudio"))
     USoundAttenuation* SoundAttenuation = nullptr;
 
-    // =================================================================
     // ÇOK OYUNCULU AYARLARI
-    // =================================================================
     
     /** Titreme durumunu çok oyunculuda çoğalt */
     UPROPERTY(EditDefaultsOnly, Category="HCS Flicker|Multiplayer")
@@ -526,9 +340,7 @@ public:
     UPROPERTY(EditDefaultsOnly, Category="HCS Flicker|Multiplayer", meta=(EditCondition="bEnablePeriodicSync", ClampMin="0.5", ClampMax="5.0"))
     float SyncInterval = 1.0f;
 
-    // =================================================================
     // PERFORMANS AYARLARI
-    // =================================================================
     
     /** Titremenin tick hızı (saniyede kaç kere güncellenecek)
      * 60: Normal (60 FPS)
@@ -538,13 +350,11 @@ public:
     UPROPERTY(EditDefaultsOnly, Category="HCS Flicker|Performance", meta=(ClampMin="10", ClampMax="120"))
     int32 TickRate = 60;
     
-    /** Yoğunluk eğri (curve) desteği (isteğe bağlı) */
+    /** Yoğunluk eğrisi desteği (isteğe bağlı) */
     UPROPERTY(EditDefaultsOnly, Category="HCS Flicker|Advanced")
     UCurveFloat* FlickerIntensityCurve = nullptr;
 
-    // =================================================================
     // IŞIK YAPILANDIRMASI
-    // =================================================================
     
     /** Otomatik bulunan tüm ışıklar (salt okunur) */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="HCS Flicker|Lights")
@@ -554,33 +364,36 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="HCS Flicker|Lights")
     TArray<FFlickerLightSettings> PerLightSettings;
 
-    // =================================================================
     // SEKANS YAPILANDIRMASI
-    // =================================================================
     
     /** Önceden tanımlanmış sekanslar */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="HCS Flicker|Sequence")
     TArray<FFlickerSequence> Sequences;
 
+    // ZAMAN ÇİZELGESİ YAPILANDIRMASI
+	
+    /** Önceden tanımlanmış zaman çizelgeleri */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="HCS Flicker|Timeline")
+	TArray<FFlickerTimelineAsset> Timelines;
+
 protected:
-    // =================================================================
-    // GÖMÜLÜ SANAL İŞLEVLER
-    // =================================================================
+    // YERLEŞİK SANAL İŞLEVLER
     
     virtual void BeginPlay() override;
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
     virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
     virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
-    // =================================================================
     // ÇOĞALTMA ÇAĞRILARI
-    // =================================================================
     
     UFUNCTION()
     void OnRep_NormalFlickerActive();
     
     UFUNCTION()
     void OnRep_BlackoutActive();
+
+	UFUNCTION()
+	void OnRep_TimelineActive();
     
     UFUNCTION()
     void OnRep_SequenceActive();
@@ -597,9 +410,7 @@ protected:
     UFUNCTION()
     void OnRep_CurrentColor();
 
-    // =================================================================
     // SUNUCU RPC
-    // =================================================================
     
     UFUNCTION(Server, Reliable, WithValidation)
     void ServerStartFlicker();
@@ -636,9 +447,12 @@ protected:
     void ServerStopSequence_Implementation();
     bool ServerStopSequence_Validate();
 
-    // =================================================================
+	UFUNCTION(Server, Reliable, WithValidation)
+	void ServerPlayTimeline(const TArray<FFlickerTimelineKey>& Keys, bool bLoop, bool bRestore);
+	void ServerPlayTimeline_Implementation(const TArray<FFlickerTimelineKey>& Keys, bool bLoop, bool bRestore);
+	bool ServerPlayTimeline_Validate(const TArray<FFlickerTimelineKey>& Keys, bool bLoop, bool bRestore);
+
     // ÇOKLU YAYIN RPC
-    // =================================================================
     
     UFUNCTION(NetMulticast, Reliable)
     void Multicast_PlaySound(USoundBase* Sound);
@@ -655,29 +469,31 @@ protected:
     UFUNCTION(NetMulticast, Reliable)
     void Multicast_SequenceStateChanged(bool bNewSequenceActive, FName SequenceName);
     void Multicast_SequenceStateChanged_Implementation(bool bNewSequenceActive, FName SequenceName);
+
+	UFUNCTION(NetMulticast, Reliable)
+    void Multicast_TimelineStateChanged(bool bNewTimelineActive, FName TimelineName);
+    void Multicast_TimelineStateChanged_Implementation(bool bNewTimelineActive, FName TimelineName);
     
     UFUNCTION(NetMulticast, Reliable)
     void Multicast_UpdateState(float Intensity, const FLinearColor& Color);
     void Multicast_UpdateState_Implementation(float Intensity, const FLinearColor& Color);
 
-    // =================================================================
     // İSTEMCİ RPC
-    // =================================================================
     
     UFUNCTION(Client, Unreliable)
     void Client_PredictionCorrection(bool bCorrectedBlackout, float CorrectedIntensity);
     void Client_PredictionCorrection_Implementation(bool bCorrectedBlackout, float CorrectedIntensity);
 
-    // =================================================================
     // İÇSEL İŞLEVLER
-    // =================================================================
     
     void SetBlackoutActive(bool bNewActive, bool bFromReplication = false);
     void PlayFlickerSound(const TSoftObjectPtr<USoundBase>& Sound, const FFlickerSoundEvent& SoundEvent);
     void UpdateNormalFlicker(float DeltaSeconds);
     void UpdateSequence(float DeltaSeconds);
+    void UpdateTimeline(float DeltaSeconds);
     void UpdateColor(float DeltaSeconds);
     FLinearColor CalculateSequenceColor() const;
+	void EvaluateTimelineAtTime(float Time, int32 PrevIndex, int32 NextIndex);
     void SetTickOptimization();
     void ForceStateSync();
     void ValidatePrediction();
@@ -687,12 +503,12 @@ protected:
     bool IsLightEnabled(FName LightTag) const;
     void SavePreSequenceState();
     void RestorePreSequenceState();
+    void SavePreTimelineState();
+    void RestorePreTimelineState();
     void CacheLights();
 
 private:
-    // =================================================================
     // ÇOĞALTILMIŞ ÖZELLİKLER (Tüm istemciler görür)
-    // =================================================================
     
     /** Normal titreme etkin mi? */
     UPROPERTY(ReplicatedUsing=OnRep_NormalFlickerActive)
@@ -701,6 +517,10 @@ private:
     /** Karartma etkin mi? */
     UPROPERTY(ReplicatedUsing=OnRep_BlackoutActive)
     bool bBlackoutActive = false;
+
+	/** Zaman çizelgesi etkin mi? */
+	UPROPERTY(ReplicatedUsing=OnRep_TimelineActive)
+	bool bTimelineActive = false;
     
     /** Sekans etkin mi? */
     UPROPERTY(ReplicatedUsing=OnRep_SequenceActive)
@@ -730,11 +550,19 @@ private:
     UPROPERTY(ReplicatedUsing=OnRep_CurrentColor)
     FLinearColor CurrentColor = FLinearColor::White;
 
-    // =================================================================
     // SALT SUNUCU ÖZELLİKLERİ (Çoğaltılmaz)
-    // =================================================================
     
-    /** Etkin sekans */
+    /** Normal titreme durumu */
+    float MicroJitterTimer = 0.0f;
+    float MicroJitterTarget = 1.0f;
+    float MicroJitterAlpha = 1.0f;
+    float DipCooldown = 0.0f;
+    float DipTimer = 0.0f;
+    float NormalBlackoutTimer = 0.0f;
+    float ColorTimer = 0.0f;
+    FLinearColor TargetColor = FLinearColor::White;
+
+	/** Etkin sekans */
     FFlickerSequence ActiveSequence;
     
     /** Sekans durumu */
@@ -746,46 +574,44 @@ private:
     bool bCurrentSequenceRestoreState = true;
     bool bCurrentSequencePlaySound = true;
     
-    /** Normal titreme durumu */
-    float MicroJitterTimer = 0.0f;
-    float MicroJitterTarget = 1.0f;
-    float MicroJitterAlpha = 1.0f;
-    float DipCooldown = 0.0f;
-    float DipTimer = 0.0f;
-    float NormalBlackoutTimer = 0.0f;
-    float ColorTimer = 0.0f;
-    FLinearColor TargetColor = FLinearColor::White;
-    
-    /** Önceki sekans durumu (restore için) */
+    /** Sekans öncesi durumu (geri yükleme için) */
     float PreSequenceIntensity = 1.0f;
     FLinearColor PreSequenceColor = FLinearColor::White;
     bool bPreSequenceNormalFlickerActive = false;
     bool bPreSequenceBlackoutActive = false;
+
+    /** Zaman çizelgesi durumu */
+	bool bTimelinePaused = false;
+	FName CurrentTimelineName = NAME_None;
+	TArray<FFlickerTimelineKey> ActiveTimelineKeys;
+	int32 CurrentKeyIndex = 0;
+	float CurrentTimelineTime = 0.0f;
+	float TimelineDuration = 0.0f;
+	bool bTimelineLoop = false;
+	bool bTimelineRestore = true;
+	
+    /** Zaman çizelgesi öncesi durumu (geri yükleme için) */
+	float PreTimelineIntensity = 1.0f;
+	FLinearColor PreTimelineColor = FLinearColor::White;
+	bool bPreTimelineNormalFlickerActive = false;
+	bool bPreTimelineBlackoutActive = false;
     
-    // =================================================================
     // PERFORMANS
-    // =================================================================
     
     float TickInterval = 0.0f;
     float TimeSinceLastTick = 0.0f;
     
-    // =================================================================
     // TAHMİN
-    // =================================================================
     
     FFlickerPredictionState PredictionState;
     float TimeSinceLastSync = 0.0f;
     
-    // =================================================================
     // EŞZAMANLAMA
-    // =================================================================
     
     FTimerHandle StateSyncTimerHandle;
     bool bOldBlackoutState = false;
     
-    // =================================================================
     // IŞIKLAR
-    // =================================================================
     
     bool bClientLightsCached = false;
     TSet<FName> DisabledLights;
