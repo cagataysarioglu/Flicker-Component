@@ -36,6 +36,24 @@ void UHCSFlickerComponent::BeginPlay()
         {
             GetWorld()->GetTimerManager().SetTimer(StateSyncTimerHandle, this, &UHCSFlickerComponent::ForceStateSync, SyncInterval, true);
         }
+
+        if (bAutoSyncOnPlayerJoin)
+        {
+            // İki saniye sonra ilk eşzamanlama yapılır (tüm istemcilerin bağlanması için)
+            GetWorld()->GetTimerManager().SetTimerForNextTick([this]()
+            {
+                // Biraz beklenir (ağın kararlı duruma gelmesi için)
+                FTimerHandle timerHandle;
+                constexpr float delay = 2.0f;
+                GetWorld()->GetTimerManager().SetTimer(timerHandle, [this]()
+                {
+                    if (GetOwnerRole() == ROLE_Authority)
+                    {
+                        ForceSyncAllClients();
+                    }
+                }, delay, false);
+            });
+        }
     }
     else
     {
@@ -44,6 +62,9 @@ void UHCSFlickerComponent::BeginPlay()
     
     CurrentColor = BaseColor;
     TargetColor = BaseColor;
+
+    LastIntensityValue = BaseIntensity;
+    LastSoundTime = 0.0f;
     
     CacheLights();
 }
@@ -97,7 +118,6 @@ void UHCSFlickerComponent::TickComponent(float DeltaTime, ELevelTick TickType, F
             OnColorUpdated.Broadcast(CurrentColor);
             
             UpdateAllLights(CurrentIntensity, CurrentColor);
-            Multicast_UpdateState(CurrentIntensity, CurrentColor);
             
             if (bEnablePeriodicSync && GetOwner())
             {
@@ -154,7 +174,6 @@ void UHCSFlickerComponent::StartFlicker()
         OnRep_NormalFlickerActive();
         SetComponentTickEnabled(true);
         UpdateAllLights(CurrentIntensity, CurrentColor);
-        Multicast_UpdateState(CurrentIntensity, CurrentColor);
         
         if (bReplicateFlickerState && GetOwner())
         {
@@ -304,17 +323,19 @@ void UHCSFlickerComponent::PlayTimeline(FName TimelineName)
     
     PlayCustomTimeline(foundTimeline->Keys, foundTimeline->bLoop, foundTimeline->bRestorePreviousState);
     CurrentTimelineName = TimelineName;
+
+    LastIntensityValue = BaseIntensity;
+    LastSoundTime = 0.0f;
 }
 
-void UHCSFlickerComponent::PlayCustomTimeline(const TArray<FFlickerTimelineKey>& Keys, bool bLoop, bool bRestore)
-{
+void UHCSFlickerComponent::PlayCustomTimeline(const TArray<FFlickerTimelineKey>& Keys, bool bLoop, bool bRestore, bool bApplyFirstKey)
+{   
     if (Keys.Num() < 2) return; // Zaman çizelgesi için en az 2 anahtar kare gerekli
     if (GetOwnerRole() == ROLE_Authority)
     {
         if (bNormalFlickerActive)
         {
             // Normal titreme geçici olarak durdurulur ama durumu saklanır
-            // StopFlicker() kullanılmamalı, çünkü o durumu sıfırlar
             bNormalFlickerActive = false;
         }
         
@@ -341,23 +362,33 @@ void UHCSFlickerComponent::PlayCustomTimeline(const TArray<FFlickerTimelineKey>&
         SetComponentTickEnabled(true);
         
         // İlk anahtar hemen uygulanır (isteğe bağlı)
-        if (Keys.IsValidIndex(0))
+        if (bApplyFirstKey && Keys.IsValidIndex(0))
         {
             CurrentIntensity = Keys[0].Intensity;
             CurrentColor = Keys[0].Color;
             
             UpdateAllLights(CurrentIntensity, CurrentColor);
-            Multicast_UpdateState(CurrentIntensity, CurrentColor);
+
+            if (AActor* owner = GetOwner())
+            {
+                owner->ForceNetUpdate();
+            }
+
+            if (Keys[0].bPlaySound)
+            {
+                PlayFlickerSound(FlickerDipSound, OnDipSound);
+            }
             
             OnTimelineKeyChanged.Broadcast(CurrentKeyIndex);
         }
 
         Multicast_TimelineStateChanged(true, CurrentTimelineName);
+        
         UE_LOG(LogTemp, Verbose, TEXT("SUNUCU - Zaman çizelgesi başlatıldı: %d anahtar, süre: %.2f"), Keys.Num(), TimelineDuration);
     }
     else
     {
-        ServerPlayTimeline(Keys, bLoop, bRestore);
+        ServerPlayTimeline(Keys, bLoop, bRestore, bApplyFirstKey);
     }
 }
 
@@ -366,32 +397,36 @@ void UHCSFlickerComponent::StopTimeline()
     if (!bTimelineActive) return;
     if (GetOwnerRole() == ROLE_Authority)
     {
+        UE_LOG(LogTemp, Warning, TEXT("Zaman çizelgesi durduruluyor - Döngü: %s"), bTimelineLoop ? TEXT("Evet") : TEXT("Hayır"));
+        
         if (bTimelineRestore)
         {
-            // Saklanmış durum geri yüklenir
             RestorePreTimelineState();
-            
+        }
+        else
+        {
             UpdateAllLights(CurrentIntensity, CurrentColor);
-            Multicast_UpdateState(CurrentIntensity, CurrentColor);
-
-            // Normal titreme geri geldiyse açık kalmalı
-            if (bNormalFlickerActive)
-            {
-                SetComponentTickEnabled(true);
-            }
         }
         
         bTimelineActive = false;
         bTimelinePaused = false;
         CurrentTimelineName = NAME_None;
-
+        
         Multicast_TimelineStateChanged(false, NAME_None);
-
-        // Zaman çizelgesi bitti ama normal titreme geri geldiyse kapatılmaz
+        
         if (!bNormalFlickerActive && !bSequenceActive)
         {
             SetComponentTickEnabled(false);
         }
+        
+        if (AActor* owner = GetOwner())
+        {
+            owner->ForceNetUpdate();
+        }
+        
+        OnTimelineFinished.Broadcast();
+        
+        UE_LOG(LogTemp, Warning, TEXT("SUNUCU - Zaman çizelgesi durduruldu"));
     }
 }
 
@@ -405,11 +440,22 @@ void UHCSFlickerComponent::SetTimelinePaused(bool bPaused)
 
 void UHCSFlickerComponent::SetTimelineTime(float NewTime)
 {
+    if (GetOwnerRole() != ROLE_Authority)
+    {
+        ServerSetTimelineTime(NewTime);
+        return;
+    }
+    
     if (!bTimelineActive || ActiveTimelineKeys.Num() < 2)
     {
         return;
     }
     
+    // Eski indeks saklanır
+    int32 oldKeyIndex = CurrentKeyIndex;
+    float oldTime = CurrentTimelineTime;
+    
+    // Yeni zaman ayarlanır
     CurrentTimelineTime = FMath::Clamp(NewTime, 0.0f, TimelineDuration);
     
     // Hangi iki anahtar arasında olduğumuz bulunur
@@ -426,8 +472,44 @@ void UHCSFlickerComponent::SetTimelineTime(float NewTime)
         }
     }
     
+    // Anahtar değişti mi?
+    bool bKeyChanged = previousIndex != oldKeyIndex;
+    
+    // Yeni indeks atanır
     CurrentKeyIndex = previousIndex;
+    
     EvaluateTimelineAtTime(CurrentTimelineTime, previousIndex, nextIndex);
+    
+    if (bKeyChanged)
+    {
+        if (ActiveTimelineKeys.IsValidIndex(CurrentKeyIndex) && ActiveTimelineKeys[CurrentKeyIndex].bPlaySound)
+        {
+            PlayFlickerSound(FlickerDipSound, OnDipSound);
+        }
+        
+        OnTimelineKeyChanged.Broadcast(CurrentKeyIndex);
+    }
+    
+    // Doğrudan son anahtara atlama yapıldıysa
+    int32 lastKeyIndex = ActiveTimelineKeys.Num() - 1;
+    
+    if (CurrentKeyIndex == lastKeyIndex && CurrentTimelineTime >= ActiveTimelineKeys[lastKeyIndex].Time)
+    {
+        if (ActiveTimelineKeys[lastKeyIndex].bPlaySound && !bKeyChanged)
+        {
+            PlayFlickerSound(FlickerDipSound, OnDipSound);
+            OnTimelineKeyChanged.Broadcast(lastKeyIndex);
+        }
+    }
+    
+    UpdateAllLights(CurrentIntensity, CurrentColor);
+    
+    if (AActor* owner = GetOwner())
+    {
+        owner->ForceNetUpdate();
+    }
+    
+    UE_LOG(LogTemp, Verbose, TEXT("Zaman çizelgesinin zamanı ayarlandı: %.2f -> %.2f, Anahtar: %d"), oldTime, CurrentTimelineTime, CurrentKeyIndex);
 }
 
 float UHCSFlickerComponent::GetTimelineDuration() const
@@ -518,6 +600,47 @@ void UHCSFlickerComponent::SetSettings(const FFlickerSettings& Settings)
 void UHCSFlickerComponent::ResetSettings()
 {
     SetSettings(FFlickerSettings());
+}
+
+void UHCSFlickerComponent::ForceSyncAllClients()
+{
+    if (GetOwnerRole() != ROLE_Authority)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("ForceSyncAllClients sadece sunucuda çağrılabilir!"));
+        return;
+    }
+
+    AActor* owner = GetOwner();
+    
+    if (!owner)
+    {
+        UE_LOG(LogTemp, Error, TEXT("ForceSyncAllClients: Sahip aktör bulunamadı!"));
+        return;
+    }
+
+    UE_LOG(LogTemp, Warning, TEXT("SUNUCU - Tüm istemcilere elle eşzamanlama gönderiliyor..."));
+
+    Multicast_UpdateState(CurrentIntensity, CurrentColor);
+
+    if (bTimelineActive)
+    {
+        Multicast_TimelineStateChanged(true, CurrentTimelineName);
+    }
+
+    if (bSequenceActive)
+    {
+        Multicast_SequenceStateChanged(true, CurrentSequenceName);
+    }
+
+    if (bBlackoutActive)
+    {
+        Multicast_BlackoutStateChanged(true);
+    }
+
+    owner->ForceNetUpdate();
+    OnSyncCompleted.Broadcast();
+    
+    UE_LOG(LogTemp, Warning, TEXT("SUNUCU - Elle eşzamanlama tamamlandı"));
 }
 
 float UHCSFlickerComponent::UpdateFlicker() const
@@ -770,12 +893,15 @@ void UHCSFlickerComponent::ServerPlaySequence_Implementation(const FFlickerSeque
     
     OnSequenceStarted.Broadcast();
     Multicast_SequenceStateChanged(true, CurrentSequenceName);
-    Multicast_UpdateState(CurrentIntensity, CurrentColor);
     
     SetComponentTickEnabled(true);
     UpdateAllLights(CurrentIntensity, CurrentColor);
+
+    LastIntensityValue = BaseIntensity;
+    LastSoundTime = 0.0f;
     
     owner->ForceNetUpdate();
+    
     UE_LOG(LogTemp, Verbose, TEXT("SUNUCU - Sekans başlatıldı: %s"), *CurrentSequenceName.ToString());
 }
 
@@ -815,25 +941,21 @@ void UHCSFlickerComponent::ServerStopSequence_Implementation()
         bNormalFlickerActive = false;
     }
     
-    // Sekans durdurulur
     bSequenceActive = false;
     CurrentSequenceName = NAME_None;
     
-    // Olaylar tetiklenir
     OnSequenceFinished.Broadcast();
     Multicast_SequenceStateChanged(false, NAME_None);
-    Multicast_UpdateState(CurrentIntensity, CurrentColor);
     
-    // Işıklar güncellenir
     UpdateAllLights(CurrentIntensity, CurrentColor);
     
-    // Tick'i kapat (eğer normal titreme de yoksa)
     if (!bNormalFlickerActive)
     {
         SetComponentTickEnabled(false);
     }
     
     owner->ForceNetUpdate();
+    
     UE_LOG(LogTemp, Verbose, TEXT("SUNUCU - Sekans durduruldu"));
 }
 
@@ -842,14 +964,29 @@ bool UHCSFlickerComponent::ServerStopSequence_Validate()
     return GetOwner() != nullptr;
 }
 
-void UHCSFlickerComponent::ServerPlayTimeline_Implementation(const TArray<FFlickerTimelineKey>& Keys, bool bLoop, bool bRestore)
+void UHCSFlickerComponent::ServerPlayTimeline_Implementation(const TArray<FFlickerTimelineKey>& Keys, bool bLoop, bool bRestore, bool bApplyFirstKey)
 {
-    PlayCustomTimeline(Keys, bLoop, bRestore);
+    PlayCustomTimeline(Keys, bLoop, bRestore, bApplyFirstKey);
 }
 
-bool UHCSFlickerComponent::ServerPlayTimeline_Validate(const TArray<FFlickerTimelineKey>& Keys, bool bLoop, bool bRestore)
+bool UHCSFlickerComponent::ServerPlayTimeline_Validate(const TArray<FFlickerTimelineKey>& Keys, bool bLoop, bool bRestore, bool bApplyFirstKey)
 {
     return Keys.Num() >= 2;
+}
+
+void UHCSFlickerComponent::ServerSetTimelineTime_Implementation(float NewTime)
+{
+    if (!GetOwner() || !GetOwner()->HasAuthority()) 
+    {
+        return;
+    }
+    
+    SetTimelineTime(NewTime);
+}
+
+bool UHCSFlickerComponent::ServerSetTimelineTime_Validate(float NewTime)
+{
+    return GetOwner() != nullptr && NewTime >= 0.0f;
 }
 
 // ÇOKLU YAYIN RPC UYGULAMALARI
@@ -1016,8 +1153,9 @@ void UHCSFlickerComponent::RestorePreTimelineState()
 void UHCSFlickerComponent::UpdateNormalFlicker(float DeltaSeconds)
 {
     DeltaSeconds = FMath::Min(DeltaSeconds, 0.1f);
+    float oldIntensity = CurrentIntensity;
     
-    // MİKRO TİTREME
+    // Mikro titreme
     MicroJitterTimer += DeltaSeconds;
     
     if (MicroJitterTimer >= 0.08f)
@@ -1037,7 +1175,7 @@ void UHCSFlickerComponent::UpdateNormalFlicker(float DeltaSeconds)
         CurrentIntensity *= curveValue;
     }
     
-    // ANİ DÜŞÜŞ
+    // Ani düşüş
     DipCooldown -= DeltaSeconds;
     
     if (DipCooldown <= 0.0f)
@@ -1070,7 +1208,7 @@ void UHCSFlickerComponent::UpdateNormalFlicker(float DeltaSeconds)
         CurrentIntensity *= FMath::FRandRange(dipMin, dipMax);
     }
     
-    // KARARTMA
+    // Karartma
     if (GetOwnerRole() == ROLE_Authority && !bSequenceActive)
     {
         float blackoutChance = 0.01f * CurrentSettings.BlackoutChanceMultiplier * DeltaSeconds * 60.0f;
@@ -1081,6 +1219,11 @@ void UHCSFlickerComponent::UpdateNormalFlicker(float DeltaSeconds)
             SetBlackoutActive(true);
             NormalBlackoutTimer = FMath::FRandRange(0.03f, 0.07f);
             PlayFlickerSound(FlickerBlackoutStartSound, OnBlackoutStartSound);
+
+            if (bEnableClientPrediction && GetOwnerRole() == ROLE_Authority)
+            {
+                Client_PredictionCorrection(true, 0.0f);
+            }
         }
     }
     
@@ -1098,8 +1241,13 @@ void UHCSFlickerComponent::UpdateNormalFlicker(float DeltaSeconds)
     
     CurrentIntensity = FMath::Clamp(CurrentIntensity, 0.0f, 1.0f);
     
-    // RENK
+    // Renk
     UpdateColor(DeltaSeconds);
+    
+    if (oldIntensity > 0.2f && CurrentIntensity < 0.1f)
+    {
+        UE_LOG(LogTemp, Verbose, TEXT("Normal titreme ani düşüş: %.2f -> %.2f"), oldIntensity, CurrentIntensity);
+    }
 }
 
 void UHCSFlickerComponent::UpdateColor(float DeltaSeconds)
@@ -1136,19 +1284,14 @@ void UHCSFlickerComponent::UpdateSequence(float DeltaSeconds)
         return;
     }
     
+    float oldIntensity = CurrentIntensity;
     FFlickerSequenceStep& currentStep = ActiveSequence.Steps[CurrentStepIndex];
     
     if (bSequenceFlickerState)
     {
-        // TİTREME
         SequenceFlickerTimer += DeltaSeconds;
         CurrentIntensity = currentStep.TargetIntensity;
         CurrentColor = currentStep.TargetColor;
-
-        if (GetOwnerRole() == ROLE_Authority && bCurrentSequencePlaySound)
-        {
-            PlayFlickerSound(FlickerDipSound, OnDipSound);
-        }
         
         if (SequenceFlickerTimer >= currentStep.FlickerDuration)
         {
@@ -1159,7 +1302,6 @@ void UHCSFlickerComponent::UpdateSequence(float DeltaSeconds)
     }
     else
     {
-        // DURAKLAMA
         SequenceStepTimer += DeltaSeconds;
         CurrentIntensity = 1.0f;
         CurrentColor = BaseColor;
@@ -1191,16 +1333,34 @@ void UHCSFlickerComponent::UpdateSequence(float DeltaSeconds)
             }
         }
     }
-}
-
-FLinearColor UHCSFlickerComponent::CalculateSequenceColor() const
-{
-    if (bSequenceActive && ActiveSequence.Steps.IsValidIndex(CurrentStepIndex))
+    
+    if (FMath::Abs(CurrentIntensity - oldIntensity) > 0.01f)
     {
-        return ActiveSequence.Steps[CurrentStepIndex].TargetColor;
+        // Sadece düşüş anlarında
+        if (CurrentIntensity < oldIntensity)
+        {
+            float dipMin = 0.25f / CurrentSettings.DipStrength;
+            float dipMax = 0.45f / CurrentSettings.DipStrength;
+            
+            // Yoğunluk, ani düşüş aralığındaysa
+            if (CurrentIntensity >= dipMin && CurrentIntensity <= dipMax)
+            {
+                PlayFlickerSound(FlickerDipSound, OnDipSound);
+            }
+        }
+        
+        // Karartma yoklaması
+        if (CurrentIntensity <= 0.05f && oldIntensity > 0.05f)
+        {
+            PlayFlickerSound(FlickerBlackoutStartSound, OnBlackoutStartSound);
+        }
+        else if (CurrentIntensity > 0.05f && oldIntensity <= 0.05f)
+        {
+            PlayFlickerSound(FlickerBlackoutEndSound, OnBlackoutEndSound);
+        }
     }
     
-    return CurrentColor;
+    UpdateAllLights(CurrentIntensity, CurrentColor);
 }
 
 // İÇSEL İŞLEVLER - ZAMAN ÇİZELGESİ YÖNETİMİ
@@ -1212,83 +1372,147 @@ void UHCSFlickerComponent::UpdateTimeline(float DeltaSeconds)
         return;
     }
     
+    float oldIntensity = CurrentIntensity;
+    int32 oldKeyIndex = CurrentKeyIndex;
+    
     CurrentTimelineTime += DeltaSeconds;
     
-    if (CurrentTimelineTime > TimelineDuration)
+    if (CurrentTimelineTime >= TimelineDuration)
     {
         if (bTimelineLoop)
         {
             CurrentTimelineTime = 0.0f;
             CurrentKeyIndex = 0;
             
-            OnTimelineKeyChanged.Broadcast(CurrentKeyIndex);
+            EvaluateTimelineAtTime(CurrentTimelineTime, 0, 1);
+            
+            float dipMin = 0.25f / CurrentSettings.DipStrength;
+            float dipMax = 0.45f / CurrentSettings.DipStrength;
+            
+            if (CurrentIntensity >= dipMin && CurrentIntensity <= dipMax && oldIntensity > CurrentIntensity + 0.1f)
+            {
+                PlayFlickerSound(FlickerDipSound, OnDipSound);
+            }
+            
+            if (oldKeyIndex != CurrentKeyIndex)
+            {
+                OnTimelineKeyChanged.Broadcast(CurrentKeyIndex);
+            }
+            
+            UpdateAllLights(CurrentIntensity, CurrentColor);
+            
+            if (AActor* owner = GetOwner())
+            {
+                owner->ForceNetUpdate();
+            }
+            
+            return;
         }
         else
         {
-            StopTimeline();
+            // Döngü yok; son anahtarda durulur ve zaman çizelgesi bitirilir
+            int32 lastKeyIndex = ActiveTimelineKeys.Num() - 1;
+            CurrentIntensity = ActiveTimelineKeys[lastKeyIndex].Intensity;
+            CurrentColor = ActiveTimelineKeys[lastKeyIndex].Color;
+            
+            float dipMin = 0.25f / CurrentSettings.DipStrength;
+            float dipMax = 0.45f / CurrentSettings.DipStrength;
+            
+            if (CurrentIntensity >= dipMin && CurrentIntensity <= dipMax && oldIntensity > CurrentIntensity + 0.1f)
+            {
+                PlayFlickerSound(FlickerDipSound, OnDipSound);
+            }
+            
+            UpdateAllLights(CurrentIntensity, CurrentColor);
+            
+            GetWorld()->GetTimerManager().SetTimerForNextTick([this]()
+            {
+                StopTimeline();
+            });
+            
             return;
         }
     }
     
-    // Hangi anahtarlar arasında olduğumuzu bul
-    int32 previousIndex = CurrentKeyIndex;
-    int32 nextIndex = CurrentKeyIndex + 1;
+    int32 previousIndex = 0;
+    int32 nextIndex = 1;
     
-    // Sonraki anahtar yoksa veya zaman aştıysa bir sonraki anahtara geçilir
-    while (nextIndex < ActiveTimelineKeys.Num() && CurrentTimelineTime >= ActiveTimelineKeys[nextIndex].Time)
+    for (int32 i = 0; i < ActiveTimelineKeys.Num() - 1; i++)
     {
-        if (ActiveTimelineKeys.IsValidIndex(nextIndex) && ActiveTimelineKeys[nextIndex].bPlaySound)
+        if (CurrentTimelineTime >= ActiveTimelineKeys[i].Time && CurrentTimelineTime < ActiveTimelineKeys[i + 1].Time)
         {
-            PlayFlickerSound(FlickerDipSound, OnDipSound);
+            previousIndex = i;
+            nextIndex = i + 1;
+            break;
         }
-        
-        CurrentKeyIndex++;
-        previousIndex = CurrentKeyIndex;
-        nextIndex = CurrentKeyIndex + 1;
-        
+    }
+
+    // Yeni değerler hesaplanır
+    EvaluateTimelineAtTime(CurrentTimelineTime, previousIndex, nextIndex);
+    
+    float dipMin = 0.25f / CurrentSettings.DipStrength;
+    float dipMax = 0.45f / CurrentSettings.DipStrength;
+
+    // Gerçek ani düşüş yoklaması
+    if (CurrentIntensity >= dipMin && CurrentIntensity <= dipMax && oldIntensity > CurrentIntensity + 0.1f)
+    {
+        PlayFlickerSound(FlickerDipSound, OnDipSound);
+    }
+
+    // Karartma yoklaması
+    if (CurrentIntensity <= 0.05f && oldIntensity > 0.1f)
+    {
+        PlayFlickerSound(FlickerBlackoutStartSound, OnBlackoutStartSound);
+    }
+    else if (CurrentIntensity > 0.05f && oldIntensity <= 0.05f)
+    {
+        PlayFlickerSound(FlickerBlackoutEndSound, OnBlackoutEndSound);
+    }
+
+    // Anahtar değişimi
+    if (previousIndex != CurrentKeyIndex)
+    {
+        CurrentKeyIndex = previousIndex;
         OnTimelineKeyChanged.Broadcast(CurrentKeyIndex);
+        
+        if (AActor* owner = GetOwner())
+        {
+            owner->ForceNetUpdate();
+        }
     }
     
-    // Eğer geçerli indeksler varsa değerlendir
-    if (ActiveTimelineKeys.IsValidIndex(previousIndex) && ActiveTimelineKeys.IsValidIndex(nextIndex))
-    {
-        EvaluateTimelineAtTime(CurrentTimelineTime, previousIndex, nextIndex);
-    }
-    else if (ActiveTimelineKeys.IsValidIndex(previousIndex))
-    {
-        // Son anahtardayız
-        CurrentIntensity = ActiveTimelineKeys[previousIndex].Intensity;
-        CurrentColor = ActiveTimelineKeys[previousIndex].Color;
-    }
+    UpdateAllLights(CurrentIntensity, CurrentColor);
 }
 
 void UHCSFlickerComponent::EvaluateTimelineAtTime(float Time, int32 PrevIndex, int32 NextIndex)
 {
     if (!ActiveTimelineKeys.IsValidIndex(PrevIndex) || !ActiveTimelineKeys.IsValidIndex(NextIndex))
     {
+        UE_LOG(LogTemp, Error, TEXT("EvaluateTimelineAtTime: Geçersiz indeks! Önceki:%d, Sonraki:%d, Toplam:%d"), PrevIndex, NextIndex, ActiveTimelineKeys.Num());
         return;
     }
     
     const FFlickerTimelineKey& previousKey = ActiveTimelineKeys[PrevIndex];
     const FFlickerTimelineKey& nextKey = ActiveTimelineKeys[NextIndex];
     
-    float alpha = 0.0f; // Alfa değeri, 0 ila 1 arası
-
+    // 0 ila 1 arasında
+    float alpha = 0.0f;
+    
     if (float timeRange = nextKey.Time - previousKey.Time; timeRange > 0.0f)
     {
         alpha = (Time - previousKey.Time) / timeRange;
     }
     
-    float easedAlpha; // Yumuşatma uygula
+    // Alfayı güvenli aralığa sıkıştırılır
+    alpha = FMath::Clamp(alpha, 0.0f, 1.0f);
+    float easedAlpha;
     
-    if (nextKey.CustomCurve) // Özel eğri kullan
+    if (nextKey.CustomCurve)
     {
         easedAlpha = nextKey.CustomCurve->GetFloatValue(alpha);
     }
-    else // Yerleşik yumuşatma işlevlerini kullan
+    else
     {
-        easedAlpha = FMath::InterpEaseInOut(0.0f, 1.0f, alpha, nextKey.BlendExp);
-        
         switch (nextKey.EasingFunction)
         {
             case EFlickerEasing::Linear:
@@ -1314,13 +1538,24 @@ void UHCSFlickerComponent::EvaluateTimelineAtTime(float Time, int32 PrevIndex, i
                 else easedAlpha = 1.0f - 0.5f * FMath::Pow(2.0f * (1.0f - alpha), nextKey.BlendExp);
                 break;
             default:
+                easedAlpha = FMath::InterpEaseInOut(0.0f, 1.0f, alpha, nextKey.BlendExp);
                 break;
         }
     }
     
-    // Yoğunluk ve renk hesaplanır
-    CurrentIntensity = FMath::Lerp(previousKey.Intensity, nextKey.Intensity, easedAlpha);
-    CurrentColor = FLinearColor::LerpUsingHSV(previousKey.Color, nextKey.Color, easedAlpha);
+    easedAlpha = FMath::Clamp(easedAlpha, 0.0f, 1.0f);
+    float newIntensity = FMath::Lerp(previousKey.Intensity, nextKey.Intensity, easedAlpha);
+    newIntensity = FMath::Clamp(newIntensity, 0.0f, 1.0f);
+    FLinearColor newColor = FLinearColor::LerpUsingHSV(previousKey.Color, nextKey.Color, easedAlpha);
+    
+    // Renk değerleri 0 ila 1 arasına sıkıştırılır (güvenlik)
+    newColor.R = FMath::Clamp(newColor.R, 0.0f, 1.0f);
+    newColor.G = FMath::Clamp(newColor.G, 0.0f, 1.0f);
+    newColor.B = FMath::Clamp(newColor.B, 0.0f, 1.0f);
+    newColor.A = FMath::Clamp(newColor.A, 0.0f, 1.0f);
+    
+    CurrentIntensity = newIntensity;
+    CurrentColor = newColor;
 }
 
 // İÇSEL İŞLEVLER - IŞIK YÖNETİMİ
@@ -1357,7 +1592,7 @@ void UHCSFlickerComponent::UpdateAllLights(float Intensity, const FLinearColor& 
 
     if (safeBaseIntensity <= 0.0f)
     {
-        constexpr float defaultIntensity = 430.0f;
+        constexpr float defaultIntensity = 100.53096f;
         safeBaseIntensity = defaultIntensity;
     }
     
@@ -1451,6 +1686,37 @@ void UHCSFlickerComponent::PlayFlickerSound(const TSoftObjectPtr<USoundBase>& So
     }
 }
 
+bool UHCSFlickerComponent::ShouldPlaySoundForIntensity(float NewIntensity)
+{
+    // Çok sık ses çalma yoklaması
+    float currentTime = GetWorld()->GetTimeSeconds();
+    
+    if (currentTime - LastSoundTime < MIN_SOUND_INTERVAL)
+    {
+        return false;  // Çok yakın zamanda ses çaldı
+    }
+    
+    // Yoğunluk değişimine bak, değerin kendisine değil
+    if (float intensityChange = LastIntensityValue - NewIntensity; intensityChange > 0.2f)  // %20'den fazla azalma
+    {
+        LastSoundTime = currentTime;
+        LastIntensityValue = NewIntensity;
+        return true;
+    }
+    
+    // Işık tamamen söndü mü? (Karartma)
+    if (NewIntensity <= 0.05f && LastIntensityValue > 0.05f)
+    {
+        LastSoundTime = currentTime;
+        LastIntensityValue = NewIntensity;
+        return true;
+    }
+    
+    // Değişim yok veya çok az
+    LastIntensityValue = NewIntensity;
+    return false;
+}
+
 // İÇSEL İŞLEVLER - PERFORMANS & EŞZAMANLAMA
 
 void UHCSFlickerComponent::SetTickOptimization()
@@ -1477,6 +1743,13 @@ void UHCSFlickerComponent::ForceStateSync()
         {
             owner->ForceNetUpdate();
         }
+    }
+    
+    // Sadece istemci tahmini etkinse ve istemci varsa çalıştır
+    if (bEnableClientPrediction && GetWorld()->GetNetMode() != NM_Standalone)
+    {
+        // Tüm bağlı istemcilere mevcut doğru durumu gönder
+        Client_PredictionCorrection(bBlackoutActive, CurrentIntensity);
     }
 }
 

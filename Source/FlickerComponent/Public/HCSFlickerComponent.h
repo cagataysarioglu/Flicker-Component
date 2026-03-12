@@ -1,7 +1,8 @@
 // HCS FLICKER COMPONENT
 // =========================================================================
-// Bu bileşen, ışık kaynaklarına titreme efekti ekler.
-// Çok oyunculu oyunlar için tam destek, KYM renk değişimi, özel sekanslar ve ses sistemi içerir.
+// Bu bileşen, ışık kaynaklarına gelişmiş titreme efekti ekler.
+// Çok oyunculu oyunlar için tam ağ desteği, KYM renk değişimi,
+// özel sekans oluşturma, zaman çizelgesi desteği ve detaylı ses sistemi bütünlüğünü içerir.
 
 #pragma once
 
@@ -120,7 +121,7 @@ public:
     
 	/** Dinamik zaman çizelgesi oynat (anahtar karelerle) */
 	UFUNCTION(BlueprintCallable, Category="HCS Flicker|Timeline")
-	void PlayCustomTimeline(const TArray<FFlickerTimelineKey>& Keys, bool bLoop = false, bool bRestore = true);
+	void PlayCustomTimeline(const TArray<FFlickerTimelineKey>& Keys, bool bLoop = false, bool bRestore = true, bool bApplyFirstKey = true);
     
 	/** Zaman çizelgesini durdur */
 	UFUNCTION(BlueprintCallable, Category="HCS Flicker|Timeline")
@@ -209,6 +210,10 @@ public:
     bool IsBlackoutActivePredicted() const { return bBlackoutActive || PredictionState.bPredictedBlackout; }
 
     // GÜNCELLEME İŞLEVLERİ (Blueprint'ten çağrılabilir)
+
+	/** Tüm istemcileri elle eşzamanlar (acil durumlar için) */
+	UFUNCTION(BlueprintCallable, Category="HCS Flicker|Multiplayer")
+	void ForceSyncAllClients();
     
     /** Her frame çağrılır - güncel yoğunluk değerini döndürür */
     UFUNCTION(BlueprintCallable, Category="HCS Flicker")
@@ -280,6 +285,10 @@ public:
 	UPROPERTY(BlueprintAssignable, Category="HCS Flicker|Events|Timeline")
 	FFlickerTimelineKeyEvent OnTimelineKeyChanged;
 
+	/** Eşzamanlama yapıldığında tetiklenir */
+	UPROPERTY(BlueprintAssignable, Category="HCS Flicker|Events|Multiplayer")
+	FFlickerSimpleDelegate OnSyncCompleted;
+
     // SES AYARLARI
     
     /** Yerleşik ses sistemini kullan (isteğe bağlı) */
@@ -339,6 +348,10 @@ public:
     /** Eşzamanlama aralığı (saniye) */
     UPROPERTY(EditDefaultsOnly, Category="HCS Flicker|Multiplayer", meta=(EditCondition="bEnablePeriodicSync", ClampMin="0.5", ClampMax="5.0"))
     float SyncInterval = 1.0f;
+	
+	/** Otomatik eşzamanlama ayarı */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="HCS Flicker|Multiplayer", AdvancedDisplay)
+	bool bAutoSyncOnPlayerJoin = true;
 
     // PERFORMANS AYARLARI
     
@@ -448,9 +461,14 @@ protected:
     bool ServerStopSequence_Validate();
 
 	UFUNCTION(Server, Reliable, WithValidation)
-	void ServerPlayTimeline(const TArray<FFlickerTimelineKey>& Keys, bool bLoop, bool bRestore);
-	void ServerPlayTimeline_Implementation(const TArray<FFlickerTimelineKey>& Keys, bool bLoop, bool bRestore);
-	bool ServerPlayTimeline_Validate(const TArray<FFlickerTimelineKey>& Keys, bool bLoop, bool bRestore);
+	void ServerPlayTimeline(const TArray<FFlickerTimelineKey>& Keys, bool bLoop, bool bRestore, bool bApplyFirstKey);
+	void ServerPlayTimeline_Implementation(const TArray<FFlickerTimelineKey>& Keys, bool bLoop, bool bRestore, bool bApplyFirstKey);
+	bool ServerPlayTimeline_Validate(const TArray<FFlickerTimelineKey>& Keys, bool bLoop, bool bRestore, bool bApplyFirstKey);
+
+	UFUNCTION(Server, Reliable, WithValidation)
+	void ServerSetTimelineTime(float NewTime);
+	void ServerSetTimelineTime_Implementation(float NewTime);
+	bool ServerSetTimelineTime_Validate(float NewTime);
 
     // ÇOKLU YAYIN RPC
     
@@ -488,17 +506,16 @@ protected:
     
     void SetBlackoutActive(bool bNewActive, bool bFromReplication = false);
     void PlayFlickerSound(const TSoftObjectPtr<USoundBase>& Sound, const FFlickerSoundEvent& SoundEvent);
+	bool ShouldPlaySoundForIntensity(float NewIntensity);
     void UpdateNormalFlicker(float DeltaSeconds);
     void UpdateSequence(float DeltaSeconds);
     void UpdateTimeline(float DeltaSeconds);
     void UpdateColor(float DeltaSeconds);
-    FLinearColor CalculateSequenceColor() const;
 	void EvaluateTimelineAtTime(float Time, int32 PrevIndex, int32 NextIndex);
     void SetTickOptimization();
     void ForceStateSync();
     void ValidatePrediction();
     bool IsClientWithinDistance(float Radius) const;
-    void UpdateAllLights(float Intensity, const FLinearColor& Color);
     FFlickerLightSettings* GetLightSettingsForTag(FName LightTag);
     bool IsLightEnabled(FName LightTag) const;
     void SavePreSequenceState();
@@ -506,6 +523,7 @@ protected:
     void SavePreTimelineState();
     void RestorePreTimelineState();
     void CacheLights();
+    void UpdateAllLights(float Intensity, const FLinearColor& Color);
 
 private:
     // ÇOĞALTILMIŞ ÖZELLİKLER (Tüm istemciler görür)
@@ -616,4 +634,10 @@ private:
     bool bClientLightsCached = false;
     TSet<FName> DisabledLights;
     TMap<FName, FLinearColor> OriginalLightColors;
+
+	// SES
+
+	float LastIntensityValue = 1.0f;
+	float LastSoundTime = 0.0f;
+	const float MIN_SOUND_INTERVAL = 0.15f; // En az 150ms aralık
 };
