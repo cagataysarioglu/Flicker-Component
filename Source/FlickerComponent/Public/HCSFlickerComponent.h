@@ -54,7 +54,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FFlickerIntensityEvent, float, Inte
  * KULLANIM:
  * 1. Bileşeni herhangi bir aktöre ekleyin
  * 2. Işık bileşenlerini ekleyin (PointLight, SpotLight vb.)
- * 3. StartFlicker() ile başlatın veya PlayFlickerSequence() ile sekans oynatın
+ * 3. StartFlicker() ile başlatın veya PlayFlickerSequence() ile bir sekans oynatın, PlayTimeline() ile bir zaman çizelgesi oynatın
  * 
  * ÇOK OYUNCULU:
  * - Aktörün "Replicates" özelliği TRUE olmalı
@@ -506,7 +506,6 @@ protected:
     
     void SetBlackoutActive(bool bNewActive, bool bFromReplication = false);
     void PlayFlickerSound(const TSoftObjectPtr<USoundBase>& Sound, const FFlickerSoundEvent& SoundEvent);
-	bool ShouldPlaySoundForIntensity(float NewIntensity);
     void UpdateNormalFlicker(float DeltaSeconds);
     void UpdateSequence(float DeltaSeconds);
     void UpdateTimeline(float DeltaSeconds);
@@ -515,7 +514,6 @@ protected:
     void SetTickOptimization();
     void ForceStateSync();
     void ValidatePrediction();
-    bool IsClientWithinDistance(float Radius) const;
     FFlickerLightSettings* GetLightSettingsForTag(FName LightTag);
     bool IsLightEnabled(FName LightTag) const;
     void SavePreSequenceState();
@@ -628,16 +626,19 @@ private:
     
     FTimerHandle StateSyncTimerHandle;
     bool bOldBlackoutState = false;
+	bool bOldNormalFlickerActive = false;
+	bool bOldSequenceActive = false;
+	bool bOldTimelineActive = false;
+	float bOldIntensity = 1.0f;
+	FLinearColor bOldColor = FLinearColor::White;
     
     // IŞIKLAR
     
     bool bClientLightsCached = false;
     TSet<FName> DisabledLights;
-    TMap<FName, FLinearColor> OriginalLightColors;
 
-	// SES
+	// YARDIMCI İŞLEVLER
 
-	float LastIntensityValue = 1.0f;
-	float LastSoundTime = 0.0f;
-	const float MIN_SOUND_INTERVAL = 0.15f; // En az 150ms aralık
+	bool IsClientWithinDistance(float Radius) const;
+	void AutoConfigureBaseIntensity();
 };
